@@ -15,6 +15,9 @@ to 2.5kHz (data) bandwidth.
 - Configured by editing a text file — no software or terminal needed.
 - Transmits any 5kHz 16-bit PCM WAV file.
 - Automatic Morse code ID with configurable tone, speed, and spacing.
+- Scheduled start and stop times with low-power sleep before and after a hunt.
+- Percentage-based or fixed-time transmit cycles.
+- 15 MB user volume for custom audio and configuration files.
 - RF output > 18dBm at full power. Down to ~ -20dBm with full attenuation.
 - Charges over USB.
 - Expansion header provides:
@@ -42,14 +45,25 @@ apply the new settings.
 To reset to factory settings, delete `settings.txt`, eject the drive, disconnect USB, and power
 cycle the PicoFox. A default settings file will be regenerated.
 
+Firmware v2 adds the four timing settings described below. If `INITIAL_SLEEP_SECS`,
+`RUNTIME_SECS`, `CYCLE_ON_SECS`, and `CYCLE_OFF_SECS` are not present in `settings.txt`, the
+PicoFox is running older firmware. After installing v2, the new settings are added to an
+existing settings file automatically.
+
 
 ### Settings Overview
 
 - `CALLSIGN`: Alphanumeric callsign (max 12 characters).
 - `ITU_ZONE`: ITU zone where the transmitter operates (`1`, `2`, or `3`).
 - `FREQ_MHZ`: Transmit frequency in MHz.
-- `ATTENUATION`: Attenuation level `0` - `127`, approximately 0.25dB steps.
-- `DUTY_CYCLE`: Transmit duty cycle percentage (`0–100`).
+- `ATTENUATION`: Attenuation level `0`–`151`, approximately 0.25dB steps.
+- `DUTY_CYCLE`: Transmit duty cycle percentage (`1`–`100`), or `0` to use the fixed-time cycle
+  settings.
+- `INITIAL_SLEEP_SECS`: Seconds to remain in low-power sleep after startup and before the first
+  transmission (`0` starts immediately).
+- `RUNTIME_SECS`: Seconds to run transmit cycles after the initial sleep (`0` runs indefinitely).
+- `CYCLE_ON_SECS`: Transmit time per cycle when `DUTY_CYCLE=0`.
+- `CYCLE_OFF_SECS`: Sleep time between transmissions when `DUTY_CYCLE=0`.
 - `MORSE_WPM`: Morse ID speed in words per minute.
 - `MORSE_FARNSWORTH_WPM`: Slower Farnsworth spacing speed (ignored if lower than `MORSE_WPM`).
 - `MORSE_TONE`: Morse tone frequency (100–2000 Hz).
@@ -58,18 +72,143 @@ cycle the PicoFox. A default settings file will be regenerated.
 **Note:** Invalid or missing values may disable the transmitter or revert to safe defaults.
 
 
+### Scheduling and Duty Cycle
+
+All timing values are whole seconds and support at least a full day (`86400`). The default remains
+continuous transmission at 100% duty cycle, starting immediately and running indefinitely. The
+60-second fixed-cycle values are present but do not take effect unless `DUTY_CYCLE` is changed to
+`0`:
+
+```text
+DUTY_CYCLE=100
+INITIAL_SLEEP_SECS=0
+RUNTIME_SECS=0
+CYCLE_ON_SECS=60
+CYCLE_OFF_SECS=60
+```
+
+`INITIAL_SLEEP_SECS` provides time to hide the fox before it starts transmitting. The
+radio output remains off and the processor uses low-power sleep during this delay. After the delay,
+`RUNTIME_SECS` starts counting. When a nonzero runtime expires, PicoFox stops the normal cycle,
+transmits its CW callsign ID one final time, switches the RF output off, and returns to indefinite
+low-power sleep. The final ID is always the last transmission, regardless of the other cycle
+settings.
+
+For the original percentage-based behavior, set `DUTY_CYCLE` from `1` to `100`. Each transmission
+contains `audio.wav` followed by the CW ID; the firmware calculates the off time needed to produce
+the selected percentage.
+
+For exact on/off times, set `DUTY_CYCLE=0`. PicoFox repeats or trims `audio.wav` to fill
+`CYCLE_ON_SECS`, reserves the end of that interval for the CW ID, then sleeps for
+`CYCLE_OFF_SECS`. If the configured on time is too short to contain the complete ID, the firmware
+raises `CYCLE_ON_SECS` to the required minimum and writes the corrected value back to
+`settings.txt`.
+
+For example, the following waits two hours, transmits in 60-second on/120-second off cycles for
+three hours, sends a final CW ID, and sleeps until the unit is collected:
+
+```text
+DUTY_CYCLE=0
+INITIAL_SLEEP_SECS=7200
+RUNTIME_SECS=10800
+CYCLE_ON_SECS=60
+CYCLE_OFF_SECS=120
+```
+
+
 ## Using the Transmitter
 
-After configuring settings as described above. The transmitter will turn on following the
-provided settings the next time it is turned on.
+After configuring settings as described above, the transmitter will turn on following the
+provided settings the next time it is turned on. The transmitter may be powered by an external USB
+power supply or the internal battery.
 
-The transmitter may be powered by an external USB power supply or the internal battery. The internal
-battery charges over USB but no indication is available to show battery charging.
+A full battery will last about ten hours at 100% duty cycle.
 
-**Note: The power switch must be ON to charge the battery over USB. The transmitter will run on USB
-power with the switch OFF but the battery will NOT be charged.**
 
-A full battery will last about five hours at 100% duty cycle, 
+## Updating the Firmware
+
+Firmware v2 supports entering the bootloader without opening the enclosure or holding the physical
+`BOOTSEL` button:
+
+1. Back up `settings.txt` and `audio.wav` before updating. The update normally preserves the user
+   volume, but keeping a copy protects your custom configuration and audio.
+2. Create an empty file named exactly `BOOTSEL` (with no extension) in the root of the `PICOFOX`
+   USB drive.
+3. Eject the `PICOFOX` drive safely, then reset or power cycle the PicoFox.
+4. Wait for the RP2040 bootloader drive named `RPI-RP2` to appear.
+5. Copy [`releases/pfoxr3v2.uf2`](releases/pfoxr3v2.uf2) to `RPI-RP2`. Do not copy the UF2 to the
+   normal `PICOFOX` drive.
+6. The board will reboot automatically. When `PICOFOX` reappears, restore or edit your settings and
+   audio as needed, eject it safely, and power cycle once more to apply them.
+
+The firmware removes the `BOOTSEL` marker before entering the bootloader, so later boots return to
+normal operation.
+
+
+### Updating Older Firmware over USB Serial
+
+Older firmware does not recognize the `BOOTSEL` marker file, but it can still enter programming
+mode through its USB serial port. Nothing needs to be typed into the console: opening the port at
+1200 baud and then closing it tells the PicoFox to start its bootloader.
+
+Before starting, close any files on the `PICOFOX` drive and wait for file copies to finish. Use a
+USB cable that supports data, not a charge-only cable.
+
+#### Linux
+
+1. Connect the PicoFox and find its serial port:
+
+   ```bash
+   ls /dev/ttyACM*
+   ```
+
+2. Run the following command, replacing `/dev/ttyACM0` if a different port was listed:
+
+   ```bash
+   stty -F /dev/ttyACM0 1200
+   ```
+
+   If the command reports "permission denied," run it again with `sudo`.
+
+#### macOS
+
+1. Connect the PicoFox and find its serial port:
+
+   ```bash
+   ls /dev/cu.usbmodem*
+   ```
+
+2. Run the following command using the complete port name reported above:
+
+   ```bash
+   stty -f /dev/cu.usbmodemXXXX 1200
+   ```
+
+#### Windows
+
+1. Connect the PicoFox.
+2. Open **Device Manager**, expand **Ports (COM & LPT)**, and note the PicoFox port, such as
+   `COM5`.
+3. Open PowerShell and run the following commands, replacing `COM5` with the correct port:
+
+   ```powershell
+   $p = [System.IO.Ports.SerialPort]::new()
+   $p.PortName = "COM5"
+   $p.BaudRate = 1200
+   $p.DtrEnable = $true
+   $p.Open()
+   Start-Sleep -Milliseconds 100
+   $p.DtrEnable = $false
+   $p.Dispose()
+   ```
+
+The normal `PICOFOX` drive and serial port will disappear. Within a few seconds, a drive named
+`RPI-RP2` should appear. Copy [`releases/pfoxr3v2.uf2`](releases/pfoxr3v2.uf2) to that drive; the
+PicoFox will reboot automatically when the copy finishes.
+
+If no serial port appears, try another USB cable or USB port and make sure another serial-monitor
+program does not already have the port open. If the serial method is unavailable, use the
+physical-button procedure in [Recovering a Board](#recovering-a-board).
 
 
 ## Replacing the Audio File
@@ -110,11 +249,11 @@ Core 0 manages flash operations. Most extensions or new features should run on c
 **Note:** Mounting the device as a USB mass storage device will interrupt clean modulation as both
 cores are blocked during flash operations.
 
-The SPI flash device is split into program memory and a FAT16 filesystem. The filesystem contains
-a text file for user-supplied settings, an audio file for transmission, a second audio file
-containing the generated morse code ID, and a hash file used to detect changes to the settings file.
-Unexpected files are automatically deleted and missing files are re-created from defaults in the
-firmware binary.
+The SPI flash device is split into program memory and a 15 MB FAT12 filesystem. The filesystem
+contains a text file for user-supplied settings, an audio file for transmission, a second audio
+file containing the generated morse code ID, and a hash file used to detect changes to the settings
+file. Missing user files are re-created from defaults in the firmware binary. A damaged filesystem
+is reformatted automatically as FAT12 before the default files are restored.
 
 The design intentionally includes large amounts of free CPU cycles, RAM, and flash so that cool
 things can be built on the PicoFox.
@@ -153,12 +292,13 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="239a", ATTRS{idProduct}=="cafe", MODE="0666"
 ### Compilation Settings
 
 - `Flash Size`: `16MB (Sketch: 1MB, FS: 15MB)`
-- `CPU Speed`: `TBD`
+- `CPU Speed`: `200 MHz`
 - `USB Stack`: `Adafruit TinyUSB`
 
-If needed for some reason you could change the partition layout to give more space for the sketch.
-Doing so would destroy all data but the code automatically formats the partition and writes
-defaults.
+Do not select a different partition layout for a release build. The firmware expects the 15 MB
+filesystem layout; another choice can hide or overwrite the user volume. If the expected filesystem
+is missing or damaged, the firmware formats a new FAT12 volume and writes defaults. The current
+firmware uses about 697 KB of the 1 MB sketch partition.
 
 All other settings are fine at default values.
 
@@ -170,6 +310,9 @@ will push the board into UF2 update mode, write the new binary, and then reset t
 operation.
 
 If that doesn't work try the following:
+- Use the `BOOTSEL` marker-file method described in [Updating the Firmware](#updating-the-firmware).
+- For firmware that does not support the marker file, use the
+  [USB serial method](#updating-older-firmware-over-usb-serial).
 - Reset the board and try again. Just tap the `RESET` button on the board to reset the RP2040.
 - Force the device into `BOOTSEL` mode. Hold the `BOOTSEL` button, tap the `RESET` button, and then
   release the `BOOTSEL` button.
