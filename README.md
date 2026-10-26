@@ -37,7 +37,7 @@ For commercial inquiries, contact [justin@ai6ym.radio](mailto:justin@ai6ym.radio
 
 ## Configuration
 
-To configure your PicoFox, connect it to any computer using a micro USB cable. It will appear as a
+To configure your PicoFox, connect it to any computer using a USB-C cable. It will appear as a
 USB mass storage device (like a flash drive). Open `settings.txt` with a text editor and adjust the
 configuration values as needed. Eject the drive, disconnect USB, and power cycle the PicoFox to
 apply the new settings.
@@ -45,13 +45,21 @@ apply the new settings.
 To reset to factory settings, delete `settings.txt`, eject the drive, disconnect USB, and power
 cycle the PicoFox. A default settings file will be regenerated.
 
-Firmware v2 adds the four timing settings described below. If `INITIAL_SLEEP_SECS`,
-`RUNTIME_SECS`, `CYCLE_ON_SECS`, and `CYCLE_OFF_SECS` are not present in `settings.txt`, the
-PicoFox is running older firmware. After installing v2, the new settings are added to an
-existing settings file automatically.
+**Note:** if the PicoFox is powered on but does not appear as a USB storage device when connected
+over USB there is a 99% chance you have a bad cable. The current record is three bad cables in a row
+before a good cable was found. The world is full of bad cables and cables built for power only with
+no data wires.
+
+This document applies to PicoFox r3 - all PicoFox orders from January 2026 on are r3 hardware. The
+r2 PicoFox had a lower output power (15mW / 12dBm) and did not include the in-series attenuator (so
+the ATTENUATION configuration field does nothing). It used a micro USB connector instead of USB-C
+and could not charge while off. Otherwise the information in this document applies.
 
 
 ### Settings Overview
+
+These settings reflect the current firmware version (v2.1). If your `settings.txt` file does not
+contain all of these settings that indicates you are running an older firmware version.
 
 - `CALLSIGN`: Alphanumeric callsign (max 12 characters).
 - `ITU_ZONE`: ITU zone where the transmitter operates (`1`, `2`, or `3`).
@@ -127,8 +135,17 @@ A full battery will last about ten hours at 100% duty cycle.
 
 ## Updating the Firmware
 
-Firmware v2 supports entering the bootloader without opening the enclosure or holding the physical
-`BOOTSEL` button:
+Most PicoFox devices in the wild are running firmware v1, this is true for both r2 and r3 hardware.
+The firmware is the same for either hardware version but some features will not work on r2.
+
+You can identify your firmware version by looking at the `settings.txt` file. If the file contains
+the `INITIAL_SLEEP_SECS` setting you are running v2 or later; if not, you are running v1.
+
+
+### v2 and Later Easy Update Method
+
+Firmware v2 and later supports entering the bootloader without opening the enclosure or holding the
+physical `BOOTSEL` button:
 
 1. Back up `settings.txt` and `audio.wav` before updating. The update normally preserves the user
    volume, but keeping a copy protects your custom configuration and audio.
@@ -136,7 +153,7 @@ Firmware v2 supports entering the bootloader without opening the enclosure or ho
    USB drive.
 3. Eject the `PICOFOX` drive safely, then reset or power cycle the PicoFox.
 4. Wait for the RP2040 bootloader drive named `RPI-RP2` to appear.
-5. Copy [`releases/pfoxr3v2.uf2`](releases/pfoxr3v2.uf2) to `RPI-RP2`. Do not copy the UF2 to the
+5. Copy [`releases/pfoxr3v2.1.uf2`](releases/pfoxr3v2.1.uf2) to `RPI-RP2`. Do not copy the UF2 to the
    normal `PICOFOX` drive.
 6. The board will reboot automatically. When `PICOFOX` reappears, restore or edit your settings and
    audio as needed, eject it safely, and power cycle once more to apply them.
@@ -145,14 +162,22 @@ The firmware removes the `BOOTSEL` marker before entering the bootloader, so lat
 normal operation.
 
 
-### Updating Older Firmware over USB Serial
+### v1 Serial Touch Method
 
 Older firmware does not recognize the `BOOTSEL` marker file, but it can still enter programming
 mode through its USB serial port. Nothing needs to be typed into the console: opening the port at
 1200 baud and then closing it tells the PicoFox to start its bootloader.
 
-Before starting, close any files on the `PICOFOX` drive and wait for file copies to finish. Use a
-USB cable that supports data, not a charge-only cable.
+Before starting, close any files on the PicoFox and wait for file copies to finish. Use a
+USB cable that supports data, not a charge-only cable. Use one of the methods below according to the
+operating system you are using.
+
+Once the PicoFox is in programming mode a drive named `RPI-RP2` should appear. Copy
+[`releases/pfoxr3v2.1.uf2`](releases/pfoxr3v2.1.uf2) to that drive; the PicoFox will reboot
+automatically when the copy finishes.
+
+If this method does not work, or you prefer not to mess with serial consoles, you may use the
+physical buttons on the board as described in the next section.
 
 #### Linux
 
@@ -202,13 +227,17 @@ USB cable that supports data, not a charge-only cable.
    $p.Dispose()
    ```
 
-The normal `PICOFOX` drive and serial port will disappear. Within a few seconds, a drive named
-`RPI-RP2` should appear. Copy [`releases/pfoxr3v2.uf2`](releases/pfoxr3v2.uf2) to that drive; the
-PicoFox will reboot automatically when the copy finishes.
+**Note:** I offer no support for this method. Windows is a terrible environment for any sort of
+embedded programming or development work of any kind.
 
-If no serial port appears, try another USB cable or USB port and make sure another serial-monitor
-program does not already have the port open. If the serial method is unavailable, use the
-physical-button procedure in [Recovering a Board](#recovering-a-board).
+
+### Physical Button Method
+
+Open the PicoFox enclosure and find the buttons on the board. One is labelled `RESET` and the other
+`BOOTSEL`. With the PicoFox connected to your computer and powered on hold the `BOOTSEL` button,
+press and release the `RESET` button, then release the `BOOTSEL` button. A drive labelled `RPI-RP2`
+should appear. Copy [`releases/pfoxr3v2.1.uf2`](releases/pfoxr3v2.1.uf2) to that drive; the PicoFox
+will reboot automatically when the copy finishes.
 
 
 ## Replacing the Audio File
@@ -244,7 +273,9 @@ software by the RP2040. To achieve smooth FM output, modulation is handled on co
 I<sup>2</sup>C running at 1 MHz. Register writes are minimized and no other devices are on
 I<sup>2</sup>C0.
 
-Core 0 manages flash operations. Most extensions or new features should run on core 0.
+Core 0 manages flash operations. Most extensions or new features should run on core 0. The latest
+firmware uses a two core buffer approach to reduce the clock speed required and so reduce power
+consumption. You may need to raise the clock speed to support any features you add.
 
 **Note:** Mounting the device as a USB mass storage device will interrupt clean modulation as both
 cores are blocked during flash operations.

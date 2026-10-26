@@ -100,9 +100,17 @@ Adafruit_FlashTransport_RP2040 flashTransport;
 Adafruit_SPIFlash flash(&flashTransport);
 
 // Filesystem and file descriptors.
+FatFormatter formatter;
 FatVolume fatfs;
 FatFile root;
 FatFile file;
+uint8_t filesystemFormatBuffer[4096];
+uint8_t filesystemSectorBuffer[512];
+
+struct VerifiedFileWrite {
+  uint32_t size;
+  uint32_t hash;
+};
 
 // Controller for USB mass storage device.
 Adafruit_USBD_MSC usb_msc;
@@ -345,169 +353,53 @@ void setPlaybackClockSpeed() {
   set_sys_clock_khz(PLAYBACK_CPU_CLOCK_KHZ, true);
 }
 
-struct Fat12Layout {
-  uint32_t partitionStart;
-  uint32_t partitionSectors;
-  uint32_t fatSectors;
-  uint32_t rootDirectorySectors;
-  uint32_t clusterCount;
-  uint8_t sectorsPerCluster;
-};
+bool labelFormattedFat16Volume() {
+  if (!flash.readSector(0, filesystemSectorBuffer)) return false;
+  MbrSector_t* mbr = reinterpret_cast<MbrSector_t*>(filesystemSectorBuffer);
+  if (getLe16(mbr->signature) != MBR_SIGNATURE) return false;
+  uint32_t partitionStart = getLe32(mbr->part[0].relativeSectors);
 
-// The SdFat formatter only supports media larger than 6MB and therefore can
-// never format PicoFox's 1MB user partition. Calculate a compact FAT12 layout
-// instead. A 63-sector partition offset matches the conventional removable
-// media layout used by desktop formatters and leaves the filesystem mountable
-// through both SdFat and USB mass storage hosts.
-bool calculateFat12Layout(uint32_t deviceSectors, uint32_t* partitionStartOut,
-                          uint32_t* partitionSectorsOut, uint32_t* fatSectorsOut,
-                          uint32_t* rootDirectorySectorsOut, uint32_t* clusterCountOut,
-                          uint8_t* sectorsPerClusterOut) {
-  constexpr uint32_t partitionStart = 63;
-  constexpr uint32_t reservedSectors = 1;
-  constexpr uint32_t fatCopies = 2;
-  constexpr uint32_t rootEntries = 128;
-  constexpr uint32_t rootDirectorySectors =
-    (rootEntries * 32 + 511) / 512;
+  if (!flash.readSector(partitionStart, filesystemSectorBuffer)) return false;
+  PbsFat_t* pbs = reinterpret_cast<PbsFat_t*>(filesystemSectorBuffer);
+  if (getLe16(pbs->signature) != PBR_SIGNATURE) return false;
+  uint16_t reservedSectors = getLe16(pbs->bpb.bpb16.reservedSectorCount);
+  uint16_t fatSectors = getLe16(pbs->bpb.bpb16.sectorsPerFat16);
+  uint32_t rootStart = partitionStart + reservedSectors +
+                       pbs->bpb.bpb16.fatCount * fatSectors;
+  memcpy(pbs->bpb.bpb16.volumeLabel, "PICOFOX    ", 11);
+  if (!flash.writeSector(partitionStart, filesystemSectorBuffer)) return false;
 
-  if (deviceSectors <= partitionStart + reservedSectors + fatCopies + rootDirectorySectors) {
-    return false;
-  }
+  if (!flash.readSector(rootStart, filesystemSectorBuffer)) return false;
+  memset(filesystemSectorBuffer, 0, 32);
+  memcpy(filesystemSectorBuffer, "PICOFOX    ", 11);
+  filesystemSectorBuffer[11] = 0x08;
+  if (!flash.writeSector(rootStart, filesystemSectorBuffer)) return false;
+  if (!flash.syncBlocks()) return false;
 
-  uint32_t partitionSectors = deviceSectors - partitionStart;
-  for (uint8_t sectorsPerCluster = 1; sectorsPerCluster <= 64; sectorsPerCluster <<= 1) {
-    uint32_t fatSectors = 1;
-    uint32_t clusterCount = 0;
-    bool converged = false;
-
-    // FAT size and cluster count depend on one another. Starting with one FAT
-    // sector and iterating converges after only a few passes for this volume.
-    for (uint8_t pass = 0; pass < 16; pass++) {
-      uint32_t metadataSectors = reservedSectors + fatCopies * fatSectors + rootDirectorySectors;
-      if (partitionSectors <= metadataSectors) return false;
-
-      clusterCount = (partitionSectors - metadataSectors) / sectorsPerCluster;
-      uint32_t fatBytes = ((clusterCount + 2) * 3 + 1) / 2;
-      uint32_t requiredFatSectors = (fatBytes + 511) / 512;
-      if (requiredFatSectors == fatSectors) {
-        converged = true;
-        break;
-      }
-      fatSectors = requiredFatSectors;
-    }
-
-    if (converged && clusterCount > 0 && clusterCount < 4085 && fatSectors <= UINT16_MAX) {
-      *partitionStartOut = partitionStart;
-      *partitionSectorsOut = partitionSectors;
-      *fatSectorsOut = fatSectors;
-      *rootDirectorySectorsOut = rootDirectorySectors;
-      *clusterCountOut = clusterCount;
-      *sectorsPerClusterOut = sectorsPerCluster;
-      return true;
-    }
-  }
-
-  return false;
+  if (!flash.readSector(partitionStart, filesystemSectorBuffer)) return false;
+  pbs = reinterpret_cast<PbsFat_t*>(filesystemSectorBuffer);
+  if (memcmp(pbs->bpb.bpb16.volumeLabel, "PICOFOX    ", 11) != 0) return false;
+  if (!flash.readSector(rootStart, filesystemSectorBuffer)) return false;
+  return memcmp(filesystemSectorBuffer, "PICOFOX    ", 11) == 0 &&
+         filesystemSectorBuffer[11] == 0x08;
 }
 
-// Creates a standards-compliant MBR and FAT12 filesystem in the flash space.
-// Only filesystem metadata is replaced; stale file data becomes unallocated.
-bool formatFlashFat12() {
-#if !FAT12_SUPPORT
-#error "PicoFox recovery formatting requires FAT12_SUPPORT"
-#endif
-
-  static_assert(sizeof(MbrSector_t) == 512, "Unexpected SdFat MBR sector size");
-  static_assert(sizeof(PbsFat_t) == 512, "Unexpected SdFat boot sector size");
-
-  Fat12Layout layout;
-  if (!calculateFat12Layout(flash.sectorCount(), &layout.partitionStart,
-                            &layout.partitionSectors, &layout.fatSectors,
-                            &layout.rootDirectorySectors, &layout.clusterCount,
-                            &layout.sectorsPerCluster)) {
-    return false;
-  }
-  if (layout.partitionSectors > UINT16_MAX) return false;
-
-  uint8_t sector[512];
-
-  // Master boot record with one FAT12 partition.
-  memset(sector, 0, sizeof(sector));
-  MbrSector_t* mbr = reinterpret_cast<MbrSector_t*>(sector);
-  MbrPart_t* partition = &mbr->part[0];
-  partition->boot = 0;
-  partition->beginCHS[0] = 1;
-  partition->beginCHS[1] = 1;
-  partition->beginCHS[2] = 0;
-  partition->type = 0x01;
-  partition->endCHS[0] = 0xfe;
-  partition->endCHS[1] = 0xff;
-  partition->endCHS[2] = 0xff;
-  setLe32(partition->relativeSectors, layout.partitionStart);
-  setLe32(partition->totalSectors, layout.partitionSectors);
-  setLe16(mbr->signature, MBR_SIGNATURE);
-  if (!flash.writeSector(0, sector)) return false;
-
-  // FAT12 partition boot sector and BIOS parameter block.
-  memset(sector, 0, sizeof(sector));
-  PbsFat_t* pbs = reinterpret_cast<PbsFat_t*>(sector);
-  pbs->jmpInstruction[0] = 0xeb;
-  pbs->jmpInstruction[1] = 0x3c;
-  pbs->jmpInstruction[2] = 0x90;
-  memcpy(pbs->oemName, "MSDOS5.0", sizeof(pbs->oemName));
-  setLe16(pbs->bpb.bpb16.bytesPerSector, 512);
-  pbs->bpb.bpb16.sectorsPerCluster = layout.sectorsPerCluster;
-  setLe16(pbs->bpb.bpb16.reservedSectorCount, 1);
-  pbs->bpb.bpb16.fatCount = 2;
-  setLe16(pbs->bpb.bpb16.rootDirEntryCount, 128);
-  setLe16(pbs->bpb.bpb16.totalSectors16, layout.partitionSectors);
-  pbs->bpb.bpb16.mediaType = 0xf8;
-  setLe16(pbs->bpb.bpb16.sectorsPerFat16, layout.fatSectors);
-  setLe16(pbs->bpb.bpb16.sectorsPerTrtack, 63);
-  setLe16(pbs->bpb.bpb16.headCount, 255);
-  setLe32(pbs->bpb.bpb16.hidddenSectors, layout.partitionStart);
-  pbs->bpb.bpb16.physicalDriveNumber = 0x80;
-  pbs->bpb.bpb16.extSignature = EXTENDED_BOOT_SIGNATURE;
-  setLe32(pbs->bpb.bpb16.volumeSerialNumber, 0x50464f58);  // "PFOX"
-  memcpy(pbs->bpb.bpb16.volumeLabel, "PICOFOX    ", sizeof(pbs->bpb.bpb16.volumeLabel));
-  memcpy(pbs->bpb.bpb16.volumeType, "FAT12   ", sizeof(pbs->bpb.bpb16.volumeType));
-  setLe16(pbs->signature, PBR_SIGNATURE);
-  if (!flash.writeSector(layout.partitionStart, sector)) return false;
-
-  uint32_t fatStart = layout.partitionStart + 1;
-  for (uint8_t fatCopy = 0; fatCopy < 2; fatCopy++) {
-    for (uint32_t fatSector = 0; fatSector < layout.fatSectors; fatSector++) {
-      memset(sector, 0, sizeof(sector));
-      if (fatSector == 0) {
-        sector[0] = 0xf8;
-        sector[1] = 0xff;
-        sector[2] = 0xff;
-      }
-      uint32_t sectorNumber = fatStart + fatCopy * layout.fatSectors + fatSector;
-      if (!flash.writeSector(sectorNumber, sector)) return false;
-    }
-  }
-
-  // Clear the complete fixed root directory so no entries from the damaged
-  // filesystem can survive recovery. Keep one standard volume-label entry so
-  // desktop hosts consistently present the drive as PICOFOX.
-  memset(sector, 0, sizeof(sector));
-  memcpy(sector, "PICOFOX    ", 11);
-  sector[11] = 0x08;
-  uint32_t rootStart = fatStart + 2 * layout.fatSectors;
-  for (uint32_t rootSector = 0; rootSector < layout.rootDirectorySectors; rootSector++) {
-    if (!flash.writeSector(rootStart + rootSector, sector)) return false;
-    memset(sector, 0, sizeof(sector));
-  }
-
-  return flash.syncBlocks();
+// Format the complete 15MB user partition as FAT16. SdFat deliberately refuses
+// media of 6MB or less, but the production PicoFox layout is large enough for
+// its standard FAT16 formatter. Add and read back the product volume label
+// before mounting the new filesystem.
+bool formatFlashFat16() {
+  fatfs.end();
+  if (!formatter.format(&flash, filesystemFormatBuffer)) return false;
+  if (!labelFormattedFat16Volume()) return false;
+  return fatfs.begin(&flash, true, 1, 0);
 }
 
 // SdFat can mount a damaged boot sector even when it claims more sectors than
 // the physical flash contains. Reject impossible geometry and unreadable FAT
 // metadata so partially mountable corruption also enters the recovery path.
 bool flashFilesystemSane() {
-  if (fatfs.fatType() != 12 || fatfs.clusterCount() == 0 ||
+  if (fatfs.fatType() != 16 || fatfs.clusterCount() == 0 ||
       fatfs.rootDirEntryCount() == 0) {
     return false;
   }
@@ -524,8 +416,8 @@ bool flashFilesystemSane() {
 
   FatFile checkRoot;
   bool rootReadable = checkRoot.openRoot(&fatfs);
-  checkRoot.close();
-  return rootReadable && fatfs.freeClusterCount() >= 0;
+  bool rootClosed = checkRoot.close();
+  return rootReadable && rootClosed && fatfs.freeClusterCount() >= 0;
 }
 
 // Reads data from flash device.
@@ -547,54 +439,181 @@ bool openRoot() {
   return root.openRoot(&fatfs);
 }
 
-void closeRoot() {
-  root.close();
+bool closeRoot() {
+  return root.close();
+}
+
+constexpr uint32_t FILE_HASH_OFFSET = 2166136261UL;
+constexpr uint32_t FILE_HASH_PRIME = 16777619UL;
+
+uint32_t updateFileHash(uint32_t hash, const void* data, size_t length) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < length; i++) {
+    hash ^= bytes[i];
+    hash *= FILE_HASH_PRIME;
+  }
+  return hash;
+}
+
+bool fileExistsChecked(const char* filename, bool* exists) {
+  if (!openRoot()) return false;
+  root.clearError();
+  *exists = root.exists(filename);
+  bool success = root.getError() == 0;
+  bool closed = closeRoot();
+  return success && closed;
+}
+
+bool readFileDigest(const char* filename, uint32_t* sizeOut, uint32_t* hashOut) {
+  if (!openRoot()) return false;
+  if (!file.open(&root, filename, O_RDONLY)) {
+    closeRoot();
+    return false;
+  }
+
+  uint32_t expectedSize = file.fileSize();
+  uint32_t remaining = expectedSize;
+  uint32_t hash = FILE_HASH_OFFSET;
+  uint8_t buffer[256];
+  bool success = true;
+  while (remaining > 0) {
+    size_t requested = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    int count = file.read(buffer, requested);
+    if (count <= 0) {
+      success = false;
+      break;
+    }
+    hash = updateFileHash(hash, buffer, count);
+    remaining -= count;
+  }
+  if (file.getError()) success = false;
+
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  if (!success || remaining != 0 || !fileClosed || !rootClosed) return false;
+
+  *sizeOut = expectedSize;
+  *hashOut = hash;
+  return true;
+}
+
+bool verifyFileDigest(const char* filename, uint32_t expectedSize, uint32_t expectedHash) {
+  uint32_t actualSize;
+  uint32_t actualHash;
+  return readFileDigest(filename, &actualSize, &actualHash) &&
+         actualSize == expectedSize && actualHash == expectedHash;
+}
+
+bool beginVerifiedFileWrite(const char* filename, VerifiedFileWrite* state) {
+  if (!openRoot()) return false;
+  if (!file.open(&root, filename, O_RDWR | O_CREAT)) {
+    closeRoot();
+    return false;
+  }
+  if (!file.truncate(0)) {
+    file.close();
+    closeRoot();
+    return false;
+  }
+  state->size = 0;
+  state->hash = FILE_HASH_OFFSET;
+  return true;
+}
+
+bool writeVerifiedChunk(VerifiedFileWrite* state, const void* data, size_t length) {
+  if (length == 0) return true;
+  if (file.write(data, length) != length || file.getWriteError()) return false;
+  state->size += length;
+  state->hash = updateFileHash(state->hash, data, length);
+  return true;
+}
+
+void abandonVerifiedFileWrite() {
+  if (file.isOpen()) file.close();
+  if (root.isOpen()) closeRoot();
+}
+
+bool finishVerifiedFileWrite(const char* filename, const VerifiedFileWrite& state) {
+  bool writeClean = !file.getWriteError();
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  bool synced = flash.syncBlocks();
+  if (!writeClean || !fileClosed || !rootClosed || !synced) return false;
+  return verifyFileDigest(filename, state.size, state.hash);
+}
+
+bool writeVerifiedFile(const char* filename, const void* data, size_t length) {
+  VerifiedFileWrite state;
+  if (!beginVerifiedFileWrite(filename, &state)) return false;
+  if (!writeVerifiedChunk(&state, data, length)) {
+    abandonVerifiedFileWrite();
+    return false;
+  }
+  return finishVerifiedFileWrite(filename, state);
+}
+
+bool readTextFile(const char* filename, String* contents) {
+  if (!openRoot()) return false;
+  if (!file.open(&root, filename, O_RDONLY)) {
+    closeRoot();
+    return false;
+  }
+
+  uint32_t expectedSize = file.fileSize();
+  if (expectedSize > 4096 || !contents->reserve(expectedSize + 1)) {
+    file.close();
+    closeRoot();
+    return false;
+  }
+  contents->remove(0);
+  uint8_t buffer[128];
+  uint32_t remaining = expectedSize;
+  bool success = true;
+  while (remaining > 0) {
+    size_t requested = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    int count = file.read(buffer, requested);
+    if (count <= 0) {
+      success = false;
+      break;
+    }
+    for (int i = 0; i < count; i++) *contents += (char)buffer[i];
+    remaining -= count;
+  }
+  if (file.getError()) success = false;
+
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  return success && remaining == 0 && fileClosed && rootClosed;
 }
 
 // Enter the ROM USB bootloader when a BOOTSEL marker is found on the user
 // volume. Delete and flush the marker first so the next application boot is
 // normal, and remain in the application if deletion fails to avoid a loop.
-void checkBootselTrigger() {
-  if (!openRoot()) return;
+bool checkBootselTrigger() {
+  if (!openRoot()) return false;
 
+  root.clearError();
   bool triggerPresent = root.exists(BOOTSEL_TRIGGER);
+  if (root.getError()) {
+    closeRoot();
+    return false;
+  }
   bool triggerRemoved = !triggerPresent || root.remove(BOOTSEL_TRIGGER);
-  closeRoot();
+  bool rootClosed = closeRoot();
 
-  if (!triggerPresent || !triggerRemoved) return;
+  if (!triggerRemoved || !rootClosed) return false;
+  if (!triggerPresent) return true;
 
-  flash.syncBlocks();
+  if (!flash.syncBlocks()) return false;
   delay(10);
   rp2040.rebootToBootloader();
-}
-
-// Removes files which shouldn't be present and applies defaults for missing files.
-void flashCleanup() {
-  // Open root filesystem.
-  if (!openRoot()) {
-    Serial.println("failed to open rootfs");
-  }
-
-  // Write the default settings if settings file is missing.
-  if (!root.exists(SETTINGS_TXT)) {
-    saveDefaultSettings();
-    Serial.println("No settings file found. Writing default settings.");
-  }
-
-  // Write the default audio if audio file is missing.
-  if (!root.exists(AUDIO_WAV)) {
-    saveDefaultAudio();
-    Serial.println("No audio file found. Writing default audio.");
-  }
-
-  // Close the filesytem.
-  closeRoot();
+  return true;
 }
 
 // Saves the default settings struct to the settings.txt file in flash.
-void saveDefaultSettings() {
+bool saveDefaultSettings() {
   char buffer[512];
-  snprintf(
+  int length = snprintf(
     buffer,
     sizeof(buffer),
     "CALLSIGN=%s\nITU_ZONE=%u\nFREQ_MHZ=%.6f\nDUTY_CYCLE=%u\nINITIAL_SLEEP_SECS=%lu\nRUNTIME_SECS=%lu\nCYCLE_ON_SECS=%lu\nCYCLE_OFF_SECS=%lu\nATTENUATION=%u\nMORSE_WPM=%u\nMORSE_FARNSWORTH_WPM=%u\nMORSE_TONE=%u\nMORSE_TONE_VOL=%u\n",
@@ -611,9 +630,8 @@ void saveDefaultSettings() {
     DEFAULT_FARNSWORTH_WPM,
     DEFAULT_MORSE_TONE_HZ,
     DEFAULT_TONE_AMPLITUDE_PERCENT);
-  file.open(&root, SETTINGS_TXT, O_RDWR | O_CREAT);
-  file.write(buffer, strlen(buffer));
-  file.close();
+  return length > 0 && length < (int)sizeof(buffer) &&
+         writeVerifiedFile(SETTINGS_TXT, buffer, length);
 }
 
 uint32_t parseSeconds(const String& value, uint32_t maximum) {
@@ -651,22 +669,17 @@ void noteTimingSetting(
 
 // Adds the new timing keys to settings files created by older firmware while
 // preserving every existing line and any user comments.
-void addMissingTimingSettings() {
-  if (!openRoot()) return;
-  if (!file.open(&root, SETTINGS_TXT, O_RDONLY)) {
-    closeRoot();
-    return;
-  }
-
+bool addMissingTimingSettings() {
+  String contents;
+  if (!readTextFile(SETTINGS_TXT, &contents)) return false;
   bool foundInitialSleepSeconds = false;
   bool foundRuntimeSeconds = false;
   bool foundCycleOnSeconds = false;
   bool foundCycleOffSeconds = false;
   bool endsWithNewline = true;
   String line;
-  int value;
-  while ((value = file.read()) >= 0) {
-    char character = (char)value;
+  for (unsigned int i = 0; i < contents.length(); i++) {
+    char character = contents[i];
     endsWithNewline = character == '\n';
     if (character == '\n') {
       noteTimingSetting(
@@ -688,63 +701,40 @@ void addMissingTimingSettings() {
       foundCycleOnSeconds,
       foundCycleOffSeconds);
   }
-  file.close();
 
   if (!foundInitialSleepSeconds || !foundRuntimeSeconds ||
       !foundCycleOnSeconds || !foundCycleOffSeconds) {
-    if (file.open(&root, SETTINGS_TXT, O_WRITE | O_APPEND)) {
-      if (!endsWithNewline) file.write('\n');
-      char additions[128];
-      int length = 0;
-      if (!foundInitialSleepSeconds) {
-        length += snprintf(
-          additions + length,
-          sizeof(additions) - length,
-          "INITIAL_SLEEP_SECS=%lu\n",
-          (unsigned long)DEFAULT_INITIAL_SLEEP_SECS);
-      }
-      if (!foundRuntimeSeconds) {
-        length += snprintf(
-          additions + length,
-          sizeof(additions) - length,
-          "RUNTIME_SECS=%lu\n",
-          (unsigned long)DEFAULT_RUNTIME_SECS);
-      }
-      if (!foundCycleOnSeconds) {
-        length += snprintf(
-          additions + length,
-          sizeof(additions) - length,
-          "CYCLE_ON_SECS=%lu\n",
-          (unsigned long)DEFAULT_CYCLE_ON_SECS);
-      }
-      if (!foundCycleOffSeconds) {
-        length += snprintf(
-          additions + length,
-          sizeof(additions) - length,
-          "CYCLE_OFF_SECS=%lu\n",
-          (unsigned long)DEFAULT_CYCLE_OFF_SECS);
-      }
-      file.write(additions, length);
-      file.close();
+    if (!endsWithNewline && contents.length() > 0) contents += '\n';
+    if (!foundInitialSleepSeconds) {
+      contents += "INITIAL_SLEEP_SECS=";
+      contents += String(DEFAULT_INITIAL_SLEEP_SECS);
+      contents += '\n';
     }
+    if (!foundRuntimeSeconds) {
+      contents += "RUNTIME_SECS=";
+      contents += String(DEFAULT_RUNTIME_SECS);
+      contents += '\n';
+    }
+    if (!foundCycleOnSeconds) {
+      contents += "CYCLE_ON_SECS=";
+      contents += String(DEFAULT_CYCLE_ON_SECS);
+      contents += '\n';
+    }
+    if (!foundCycleOffSeconds) {
+      contents += "CYCLE_OFF_SECS=";
+      contents += String(DEFAULT_CYCLE_OFF_SECS);
+      contents += '\n';
+    }
+    return writeVerifiedFile(SETTINGS_TXT, contents.c_str(), contents.length());
   }
-  closeRoot();
+  return true;
 }
 
 // Rewrites one setting while preserving all unrelated lines. This is used to
 // make an automatically corrected CYCLE_ON_SECS value visible on the USB drive.
 bool writeSettingValue(const char* settingName, uint32_t settingValue) {
-  if (!openRoot()) return false;
-  if (!file.open(&root, SETTINGS_TXT, O_RDONLY)) {
-    closeRoot();
-    return false;
-  }
-
   String contents;
-  contents.reserve(file.fileSize() + 32);
-  int value;
-  while ((value = file.read()) >= 0) contents += (char)value;
-  file.close();
+  if (!readTextFile(SETTINGS_TXT, &contents)) return false;
 
   String updated;
   updated.reserve(contents.length() + 32);
@@ -780,52 +770,82 @@ bool writeSettingValue(const char* settingName, uint32_t settingValue) {
     updated += '\n';
   }
 
-  bool success = false;
-  if (file.open(&root, SETTINGS_TXT, O_RDWR)) {
-    if (file.truncate(0)) {
-      success = file.write(updated.c_str(), updated.length()) == updated.length();
-    }
-    file.close();
-  }
-  closeRoot();
-  return success;
+  return writeVerifiedFile(SETTINGS_TXT, updated.c_str(), updated.length());
 }
 
 // Saves the default audio wav to the audio.wav file in flash.
-void saveDefaultAudio() {
-  file.open(&root, AUDIO_WAV, O_RDWR | O_CREAT);
-  file.write(wavHeader, sizeof(wavHeader));  // Write wav header once.
+bool saveDefaultAudio() {
+  VerifiedFileWrite state;
+  if (!beginVerifiedFileWrite(AUDIO_WAV, &state)) return false;
+  bool success = writeVerifiedChunk(&state, wavHeader, sizeof(wavHeader));
   // Loop default audio to produce longer playback between IDs and transmitter cycling.
-  for (int i = 0; i < DEFAULT_AUDIO_LOOPS; i++) {
-    file.write(defaultAudio, sizeof(defaultAudio));
+  for (int i = 0; success && i < DEFAULT_AUDIO_LOOPS; i++) {
+    success = writeVerifiedChunk(&state, defaultAudio, sizeof(defaultAudio));
   }
-  file.close();
+  if (!success) {
+    abandonVerifiedFileWrite();
+    return false;
+  }
+  return finishVerifiedFileWrite(AUDIO_WAV, state);
 }
 
-uint32_t wavSampleCount(const char* filename) {
-  if (!openRoot()) return 0;
+bool wavSampleCount(const char* filename, uint32_t* sampleCountOut) {
+  if (!openRoot()) return false;
   if (!file.open(&root, filename, O_RDONLY)) {
     closeRoot();
-    return 0;
+    return false;
   }
 
-  char header[44];
+  uint8_t header[44];
   uint32_t fileSize = file.fileSize();
-  bool valid = file.read(header, sizeof(header)) == (int)sizeof(header) &&
-               strncmp(header, "RIFF", 4) == 0 &&
-               strncmp(header + 8, "WAVE", 4) == 0;
-  file.close();
-  closeRoot();
-  return valid && fileSize >= sizeof(header) ? (fileSize - sizeof(header)) / sizeof(int16_t) : 0;
+  bool success = fileSize >= sizeof(header) &&
+                 ((fileSize - sizeof(header)) % sizeof(int16_t)) == 0 &&
+                 file.read(header, sizeof(header)) == (int)sizeof(header) &&
+                 memcmp(header, "RIFF", 4) == 0 &&
+                 memcmp(header + 8, "WAVE", 4) == 0;
+
+  uint8_t buffer[256];
+  uint32_t remaining = success ? fileSize - sizeof(header) : 0;
+  while (success && remaining > 0) {
+    size_t requested = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    int count = file.read(buffer, requested);
+    if (count <= 0) {
+      success = false;
+      break;
+    }
+    remaining -= count;
+  }
+  if (file.getError()) success = false;
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  if (!success || remaining != 0 || !fileClosed || !rootClosed) return false;
+
+  *sampleCountOut = (fileSize - sizeof(header)) / sizeof(int16_t);
+  return true;
 }
 
 // Loads the settings.txt file in flash into a settings struct.
-void loadSettings() {
-  openRoot();
+bool loadSettings() {
+  if (!openRoot()) return false;
   if (!file.open(&root, SETTINGS_TXT, O_RDONLY)) {
-    Serial.println("Failed to open settings.txt");
-    return;
+    closeRoot();
+    return false;
   }
+
+  memset(settings.callsign, 0, sizeof(settings.callsign));
+  settings.ituZone = DEFAULT_ITU_ZONE;
+  settings.transmitFreqMHz = DEFAULT_FREQ_MHZ;
+  settings.dutyCyclePercent = DEFAULT_DUTY_CYCLE;
+  settings.initialSleepSeconds = DEFAULT_INITIAL_SLEEP_SECS;
+  settings.runtimeSeconds = DEFAULT_RUNTIME_SECS;
+  settings.cycleOnSeconds = DEFAULT_CYCLE_ON_SECS;
+  settings.cycleOffSeconds = DEFAULT_CYCLE_OFF_SECS;
+  settings.morseWPM = DEFAULT_WPM;
+  settings.farnsworthWPM = DEFAULT_FARNSWORTH_WPM;
+  settings.morseToneHz = DEFAULT_MORSE_TONE_HZ;
+  settings.toneAmplitudePercent = DEFAULT_TONE_AMPLITUDE_PERCENT;
+  settings.attenuation = DEFAULT_ATTENUATION;
+  settings.isConfigured = false;
 
   String line = "";
   int c;
@@ -836,7 +856,10 @@ void loadSettings() {
     ch = toupper(ch);
     if (ch == '\n') {
       int sep = line.indexOf('=');
-      if (sep == -1) continue;
+      if (sep == -1) {
+        line = "";
+        continue;
+      }
       String key = line.substring(0, sep);
       String val = line.substring(sep + 1);
       if (key == "CALLSIGN") strncpy(settings.callsign, val.c_str(), sizeof(settings.callsign) - 1);
@@ -862,8 +885,10 @@ void loadSettings() {
       line += ch;
     }
   }
-  file.close();
-  closeRoot();
+  bool readClean = !file.getError();
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  if (!readClean || !fileClosed || !rootClosed) return false;
 
   // Validate config and apply defaults when config is weird.
   if (settings.dutyCyclePercent > 100) {
@@ -901,40 +926,28 @@ void loadSettings() {
   if (transmitFreqHz < minFreqHz || transmitFreqHz > maxFreqHz) {
     settings.isConfigured = false;
   }
-}
-
-bool settingsChanged() {
-  // If the marker file can be opened for reading check for a match, assume regen needed if file open fails.
-  if (file.open(&root, SETTINGS_CRC, O_RDONLY)) {
-    int savedCrc;
-    file.read((void*)&savedCrc, sizeof(savedCrc));
-    file.close();
-    if (savedCrc == settingsCrc) {
-      return false;
-    }
-  }
-
-  file.close();
   return true;
 }
 
+bool readExactFile(const char* filename, void* destination, size_t length) {
+  if (!openRoot()) return false;
+  if (!file.open(&root, filename, O_RDONLY)) {
+    closeRoot();
+    return false;
+  }
+  bool success = file.fileSize() == length &&
+                 file.read(destination, length) == (int)length &&
+                 !file.getError();
+  bool fileClosed = file.close();
+  bool rootClosed = closeRoot();
+  return success && fileClosed && rootClosed;
+}
+
 // Generates an audio morse code ID from the provided callsign.
-void generateMorseAudio() {
-  openRoot();
-  if (!file.open(&root, CALLSIGN_WAV, O_RDWR | O_CREAT)) {
-    Serial.println("Failed to open .callsign.wav");
-    return;
-  }
-
-  // Remove the existing data, if any.
-  file.remove();
-  if (!file.open(&root, CALLSIGN_WAV, O_RDWR | O_CREAT)) {
-    Serial.println("Failed to re-open .callsign.wav after nuking the old one.");
-    return;
-  }
-
-  // Write wav header.
-  file.write(wavHeader, sizeof(wavHeader));
+bool generateMorseAudio() {
+  VerifiedFileWrite state;
+  if (!beginVerifiedFileWrite(CALLSIGN_WAV, &state)) return false;
+  bool writeSucceeded = writeVerifiedChunk(&state, wavHeader, sizeof(wavHeader));
 
   const int sampleRate = AUDIO_SAMPLE_RATE_HZ;
   const int toneFreq = settings.morseToneHz;
@@ -947,20 +960,20 @@ void generateMorseAudio() {
 
   auto writeTone = [&](double durationSec) {
     int samples = (int)(durationSec * sampleRate);
-    for (int i = 0; i < samples; i++) {
+    for (int i = 0; writeSucceeded && i < samples; i++) {
       double envelope = 1.0f;
       if (i < riseFall) envelope = i / riseFall;
       else if (i > samples - riseFall) envelope = (samples - i) / riseFall;
       int16_t sample = (int16_t)(amplitude * envelope * sinf(toneStep * i));
-      file.write((uint8_t*)&sample, 2);
+      writeSucceeded = writeVerifiedChunk(&state, &sample, sizeof(sample));
     }
   };
 
   auto writeSilence = [&](double durationSec) {
     int samples = (int)(durationSec * sampleRate);
     int16_t zero = 0;
-    for (int i = 0; i < samples; i++) {
-      file.write((uint8_t*)&zero, 2);
+    for (int i = 0; writeSucceeded && i < samples; i++) {
+      writeSucceeded = writeVerifiedChunk(&state, &zero, sizeof(zero));
     }
   };
 
@@ -988,72 +1001,109 @@ void generateMorseAudio() {
     }
     writeSilence(interCharLengthSec);
   }
-  file.close();
-
-  // Write a marker to indicate that the current callsign was generated.
-  file.open(&root, SETTINGS_CRC, O_RDWR | O_CREAT);
-  file.write((const void*)&settingsCrc, sizeof(settingsCrc));
-  file.close();
-
-  closeRoot();
+  if (!writeSucceeded) {
+    abandonVerifiedFileWrite();
+    return false;
+  }
+  if (!finishVerifiedFileWrite(CALLSIGN_WAV, state)) return false;
+  return writeVerifiedFile(SETTINGS_CRC, &settingsCrc, sizeof(settingsCrc));
 }
 
 // Regenerates morse code ID audio if the callsign has changed.
-void generateMorseIfNeeded() {
-  openRoot();
-  bool regenerate = true;
+bool generateMorseIfNeeded() {
+  bool callsignExists;
+  bool markerExists;
+  if (!fileExistsChecked(CALLSIGN_WAV, &callsignExists) ||
+      !fileExistsChecked(SETTINGS_CRC, &markerExists)) return false;
 
-  // Check for changes in settings file.
-  if (!settingsChanged()) {
-    regenerate = false;
+  if (callsignExists) {
+    uint32_t ignoredSamples;
+    if (!wavSampleCount(CALLSIGN_WAV, &ignoredSamples)) return false;
   }
 
-  // Force regen if the callsign audio file is missing.
-  if (!root.exists(CALLSIGN_WAV)) {
-    regenerate = true;
+  int savedCrc = 0;
+  if (markerExists && !readExactFile(SETTINGS_CRC, &savedCrc, sizeof(savedCrc))) {
+    return false;
   }
-  closeRoot();
 
-  if (regenerate) {
-    Serial.println("Detected settings change, generating new callsign audio");
-    generateMorseAudio();
+  if (!callsignExists || !markerExists || savedCrc != settingsCrc) {
+    return generateMorseAudio();
   }
+  return true;
 }
 
-void saveSettingsCrcMarker() {
-  if (!openRoot()) return;
-  if (file.open(&root, SETTINGS_CRC, O_RDWR | O_CREAT)) {
-    file.truncate(0);
-    file.write((const void*)&settingsCrc, sizeof(settingsCrc));
-    file.close();
-  }
-  closeRoot();
+bool saveSettingsCrcMarker() {
+  return writeVerifiedFile(SETTINGS_CRC, &settingsCrc, sizeof(settingsCrc));
 }
 
-void validateTimedCycleSettings() {
-  callsignAudioSamples = wavSampleCount(CALLSIGN_WAV);
+bool validateTimedCycleSettings() {
+  if (!wavSampleCount(CALLSIGN_WAV, &callsignAudioSamples)) return false;
   uint32_t minimumOnSeconds =
     (callsignAudioSamples + AUDIO_SAMPLE_RATE_HZ - 1) / AUDIO_SAMPLE_RATE_HZ;
-  if (settings.cycleOnSeconds >= minimumOnSeconds) return;
+  if (settings.cycleOnSeconds >= minimumOnSeconds) return true;
 
   settings.cycleOnSeconds = minimumOnSeconds;
-  if (writeSettingValue("CYCLE_ON_SECS", settings.cycleOnSeconds)) {
-    // Refresh the checksum after changing settings.txt. CYCLE_ON_SECS does not alter
-    // the generated ID, so advance its marker without regenerating the WAV.
-    loadSettings();
-    saveSettingsCrcMarker();
-  } else {
-    Serial.println("Failed to save corrected CYCLE_ON_SECS");
-  }
+  if (!writeSettingValue("CYCLE_ON_SECS", settings.cycleOnSeconds)) return false;
+  // Refresh the checksum after changing settings.txt. CYCLE_ON_SECS does not alter
+  // the generated ID, so advance its marker without regenerating the WAV.
+  return loadSettings() && saveSettingsCrcMarker();
 }
 
-// Remove junk, load settings and audio data. Generate morse ID audio if necessary.
-void loadFlashData() {
-  flashCleanup();
-  addMissingTimingSettings();
-  loadSettings();
-  generateMorseIfNeeded();
-  validateTimedCycleSettings();
+// Fully validate and load every file used during startup. Missing base files
+// are recreated in place and verified; an I/O failure or invalid existing file
+// is promoted to a filesystem failure so the caller can reformat and rebuild.
+bool loadFlashData() {
+  bool settingsExists;
+  bool audioExists;
+  uint32_t ignoredSize;
+  uint32_t ignoredHash;
+  uint32_t ignoredSamples;
+
+  if (!fileExistsChecked(SETTINGS_TXT, &settingsExists)) return false;
+  if (!settingsExists) {
+    if (!saveDefaultSettings()) return false;
+  } else if (!readFileDigest(SETTINGS_TXT, &ignoredSize, &ignoredHash)) {
+    return false;
+  }
+
+  if (!fileExistsChecked(AUDIO_WAV, &audioExists)) return false;
+  if (!audioExists) {
+    if (!saveDefaultAudio()) return false;
+  } else if (!wavSampleCount(AUDIO_WAV, &ignoredSamples)) {
+    return false;
+  }
+
+  if (!addMissingTimingSettings()) return false;
+  if (!loadSettings()) return false;
+  if (!generateMorseIfNeeded()) return false;
+  return validateTimedCycleSettings();
+}
+
+bool createDefaultFlashData() {
+  return saveDefaultSettings() && saveDefaultAudio() && loadFlashData();
+}
+
+bool recoverFlashFilesystem() {
+  fatfs.end();
+  return formatFlashFat16() && flashFilesystemSane() && createDefaultFlashData();
+}
+
+bool initializeFlashFilesystem() {
+  bool mounted = fatfs.begin(&flash, true, 1, 0);
+  if (mounted && flashFilesystemSane() && loadFlashData()) return true;
+  return recoverFlashFilesystem();
+}
+
+void blinkFilesystemFailure() {
+  pinMode(AMP_EN, OUTPUT);
+  digitalWrite(AMP_EN, HIGH);
+  pinMode(TX_LED, OUTPUT);
+  while (true) {
+    digitalWrite(TX_LED, HIGH);
+    delay(1000);
+    digitalWrite(TX_LED, LOW);
+    delay(1000);
+  }
 }
 
 uint64_t configuredCarrierCentiHz() {
@@ -1628,30 +1678,14 @@ void setup() {
     delay(1000);
   }
 
-  // Mount and validate the filesystem. A damaged BPB may look mountable while
-  // describing sectors outside the real flash, so a successful begin() alone
-  // is not sufficient.
-  bool filesystemReady = fatfs.begin(&flash, true, 1, 0);
-  if (filesystemReady && !flashFilesystemSane()) {
-    Serial.println("Flash filesystem metadata is invalid, attempting recovery.");
-    fatfs.end();
-    filesystemReady = false;
+  // Do not expose USB storage until the FAT16 volume, every required file, and
+  // every startup write have been read back successfully. One failed attempt
+  // reformats and rebuilds the complete filesystem; a failed rebuild is fatal.
+  bool filesystemReady = initializeFlashFilesystem();
+  if (filesystemReady && !checkBootselTrigger()) {
+    filesystemReady = recoverFlashFilesystem();
   }
-
-  if (!filesystemReady) {
-    Serial.println("Flash not formatted, attempting to format.");
-    fatfs.end();
-    filesystemReady = formatFlashFat12() &&
-                      fatfs.begin(&flash, true, 1, 0) &&
-                      flashFilesystemSane();
-    if (!filesystemReady) {
-      Serial.println("Flash formatting or verification failed.");
-      while (true) delay(1000);
-    }
-    Serial.println("Flash successfully formatted as FAT12.");
-  }
-  checkBootselTrigger();
-  loadFlashData();
+  if (!filesystemReady) blinkFilesystemFailure();
 
   // Check for test mode before generating the carrier-specific frequency table.
   pinMode(TEST_MODE_PIN, INPUT_PULLDOWN);
@@ -1661,7 +1695,7 @@ void setup() {
   }
 
   // Init USB mass storage device.
-  usb_msc.setID("AI6YM", "PicoFox", "2.0");
+  usb_msc.setID("AI6YM", "PicoFox", "2.1");
   usb_msc.setReadWriteCallback(mscReadCb, mscWriteCb, mscFlushCb);
   usb_msc.setCapacity(flash.size() / 512, 512);
   usb_msc.setUnitReady(true);
